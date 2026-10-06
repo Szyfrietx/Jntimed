@@ -1,0 +1,119 @@
+# Untimed v1.0.1 | 2026-10-06 | P-UNTIMED-ANDROID-001
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Locate project (repo root, or the newest .zip that contains gradlew)
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f gradlew ]; then
+            dir="."
+          else
+            best=""; best_ts=0
+            while IFS= read -r -d '' z; do
+              if unzip -Z1 "$z" 2>/dev/null | grep -Eq '(^|/)gradlew$'; then
+                ts=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
+                [ -z "$ts" ] && ts=0
+                if [ -z "$best" ] || [ "$ts" -ge "$best_ts" ]; then best="$z"; best_ts="$ts"; fi
+              fi
+            done < <(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -not -path './_project/*' -print0)
+            if [ -z "$best" ]; then echo "::error::No gradlew at repo root and no .zip containing gradlew was found."; exit 1; fi
+            echo "Using $best"
+            rm -rf _project && mkdir _project
+            unzip -q -o "$best" -d _project
+            gw=$(find _project -maxdepth 4 -name gradlew -not -path '*/__MACOSX/*' | head -n 1)
+            if [ -z "$gw" ]; then echo "::error::gradlew not found inside $best"; exit 1; fi
+            dir=$(dirname "$gw")
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Project directory: $dir"
+          ls -la "$dir"
+
+      - name: Normalise wrapper (CRLF, exec bit)
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          sed -i 's/\r$//' gradlew
+          chmod +x gradlew
+          test -f gradle/wrapper/gradle-wrapper.jar && echo "wrapper jar present" || echo "wrapper jar MISSING (will use system Gradle)"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses and install platform tools (best effort)
+        shell: bash
+        run: |
+          set +e
+          SDKM="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null 2>&1
+            "$SDKM" "platforms;android-35" "build-tools;34.0.0" > /dev/null 2>&1
+          else
+            echo "sdkmanager not found; relying on AGP auto-download"
+          fi
+          exit 0
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then GR=./gradlew; else GR=gradle; fi
+          $GR assembleDebug --no-daemon --stacktrace
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          f=$(find app/build/outputs/apk/debug -name '*.apk' | head -n 1)
+          if [ -z "$f" ]; then echo "::error::No APK produced"; exit 1; fi
+          echo "path=${{ steps.locate.outputs.dir }}/$f" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: untimed-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.locate.outputs.dir }}/**/build/reports/**
+          if-no-files-found: ignore
+
+      - name: Unit tests (reported, does not block the APK)
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then GR=./gradlew; else GR=gradle; fi
+          $GR testDebugUnitTest --no-daemon
